@@ -16,7 +16,6 @@
 #include <linux/version.h>
 
 #include "super.h"
-
 #define f_dentry f_path.dentry
 /* A super block lock that must be used for any critical section operation on the sb,
  * such as: updating the free_blocks, inodes_count etc. */
@@ -33,11 +32,110 @@ static DEFINE_MUTEX(simplefs_inodes_mgmt_lock);
 static DEFINE_MUTEX(simplefs_directory_children_update_lock);
 
 static struct kmem_cache *sfs_inode_cachep;
+static struct kmem_cache *sfs_entry_cachep;
+
+struct simplefs_cache_entry {
+	struct simplefs_dir_record record;
+	struct list_head list;
+	int entry_no;
+};
+
+struct simplefs_dir_cache {
+	uint64_t dir_children_count;
+	struct list_head used;
+	struct list_head free;
+};
+
+
+static struct simplefs_dir_cache *simplefs_cache_alloc(void)
+{
+    struct simplefs_dir_cache *dir_cache;
+    dir_cache = kzalloc(sizeof(struct simplefs_dir_cache), GFP_KERNEL);
+    if (!dir_cache)
+        ERR_PTR(-ENOMEM);
+
+    INIT_LIST_HEAD(&dir_cache->free);
+    INIT_LIST_HEAD(&dir_cache->used);
+
+    return dir_cache;
+}
+
+static int dir_cache_build(struct simplefs_dir_cache *dir_cache, struct buffer_head *bh)
+{
+	struct simplefs_dir_record *record;
+	struct simplefs_cache_entry *cache_entry;
+	int i;
+
+	record = (struct simplefs_dir_record *)bh->b_data;
+	for (i = 0; i < SIMPLEFS_MAX_CHILDREN_CNT; i++, record++) {
+		cache_entry = kmem_cache_alloc(sfs_entry_cachep, GFP_KERNEL);
+		if (!cache_entry)
+			return -ENOMEM;
+
+		cache_entry->entry_no = i;
+
+		if (record->inode_no != 0) {
+			memcpy(&cache_entry->record, record, sizeof(struct simplefs_dir_record));
+			list_add_tail(&cache_entry->list, &dir_cache->used);
+		} else {
+			list_add_tail(&cache_entry->list, &dir_cache->free);
+		}
+	}
+
+	return 0;
+}
+
+#ifdef SIMPLEFS_DEBUG
+static void travers_dir_cache(struct simplefs_dir_cache *dir_cache)
+{
+	struct simplefs_cache_entry *cache_entry;
+	pr_info("print used record:\n");
+	list_for_each_entry(cache_entry, &dir_cache->used, list)
+		pr_info("record name %s, ino %lld, entry_no %d",
+			cache_entry->record.filename, cache_entry->record.inode_no, cache_entry->entry_no);
+
+	pr_info("print free record:\n");
+	list_for_each_entry(cache_entry, &dir_cache->free, list)
+		pr_info("record entry_no %d", cache_entry->entry_no);
+}
+#endif
+
+static struct simplefs_cache_entry *used_cache_entry_get(struct simplefs_dir_cache *dir_cache,
+										struct dentry *dentry)
+{
+	struct simplefs_cache_entry *cache_entry;
+
+	list_for_each_entry(cache_entry, &dir_cache->used, list) {
+		if (!strcmp(cache_entry->record.filename, dentry->d_name.name)) {
+			return cache_entry;
+		}
+	}
+
+	return NULL;
+}
+
+static void cache_entry_insert(struct list_head *head, struct simplefs_cache_entry *cache_entry)
+{
+	struct simplefs_cache_entry *tmp_entry;
+	list_del(&cache_entry->list);
+
+	list_for_each_entry(tmp_entry, head, list) {
+		if (cache_entry->entry_no < tmp_entry->entry_no)
+			break;
+	}
+
+	list_add_tail(&cache_entry->list, &tmp_entry->list);
+}
+
+static struct simplefs_cache_entry *free_cache_entry_get(struct simplefs_dir_cache *dir_cache)
+{
+	return list_first_entry(&dir_cache->free, struct simplefs_cache_entry, list);
+}
 
 void simplefs_sb_sync(struct super_block *vsb)
 {
 	struct buffer_head *bh;
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 
 	bh = sb_bread(vsb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
 	BUG_ON(!bh);
@@ -53,8 +151,8 @@ struct simplefs_inode *simplefs_inode_search(struct super_block *sb,
 		struct simplefs_inode *search)
 {
 	uint64_t count = 0;
-	while (start->inode_no != search->inode_no
-			&& count < SIMPLEFS_SB(sb)->inodes_count) {
+	int icount = SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_inode);
+	while (start->inode_no != search->inode_no && count < icount) {
 		count++;
 		start++;
 	}
@@ -68,7 +166,7 @@ struct simplefs_inode *simplefs_inode_search(struct super_block *sb,
 
 void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 {
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(vsb);
 	struct buffer_head *bh;
 	struct simplefs_inode *inode_iterator;
 
@@ -88,10 +186,10 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 	}
 
 	/* Append the new inode in the end in the inode store */
-	inode_iterator += sb->inodes_count;
-
+	inode_iterator += inode->inode_no;
 	memcpy(inode_iterator, inode, sizeof(struct simplefs_inode));
-	sb->inodes_count++;
+	sb_info->sb->inodes_count++;
+	set_bit(inode->inode_no, &sb_info->imap);
 
 	mark_buffer_dirty(bh);
 	simplefs_sb_sync(vsb);
@@ -111,7 +209,7 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
  * will still be marked as non-free. You need fsck to fix this.*/
 int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out)
 {
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 	int i;
 	int ret = 0;
 
@@ -150,7 +248,7 @@ end:
 static int simplefs_sb_get_objects_count(struct super_block *vsb,
 					 uint64_t * out)
 {
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
@@ -162,34 +260,19 @@ static int simplefs_sb_get_objects_count(struct super_block *vsb,
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 static int simplefs_iterate(struct file *filp, struct dir_context *ctx)
-#else
-static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
-#endif
 {
 	loff_t pos;
 	struct inode *inode;
 	struct super_block *sb;
-	struct buffer_head *bh;
 	struct simplefs_inode *sfs_inode;
-	struct simplefs_dir_record *record;
-	int i;
+	struct dentry *dentry = filp->f_path.dentry;
+	struct simplefs_dir_cache *dir_cache = dentry->d_fsdata;
+	struct simplefs_cache_entry *cache_entry;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 	pos = ctx->pos;
-#else
-	pos = filp->f_pos;
-#endif
 	inode = filp->f_dentry->d_inode;
 	sb = inode->i_sb;
-
-	if (pos) {
-		/* FIXME: We use a hack of reading pos to figure if we have filled in all data.
-		 * We should probably fix this to work in a cursor based model and
-		 * use the tokens correctly to not fill too many data in each cursor based call */
-		return 0;
-	}
 
 	sfs_inode = SIMPLEFS_INODE(inode);
 
@@ -201,24 +284,19 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		return -ENOTDIR;
 	}
 
-	bh = sb_bread(sb, sfs_inode->data_block_number);
-	BUG_ON(!bh);
-
-	record = (struct simplefs_dir_record *)bh->b_data;
-	for (i = 0; i < sfs_inode->dir_children_count; i++) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
-		dir_emit(ctx, record->filename, SIMPLEFS_FILENAME_MAXLEN,
-			record->inode_no, DT_UNKNOWN);
-		ctx->pos += sizeof(struct simplefs_dir_record);
-#else
-		filldir(dirent, record->filename, SIMPLEFS_FILENAME_MAXLEN, pos,
-			record->inode_no, DT_UNKNOWN);
-		filp->f_pos += sizeof(struct simplefs_dir_record);
-#endif
-		pos += sizeof(struct simplefs_dir_record);
-		record++;
+	if (pos) {
+		/* FIXME: We use a hack of reading pos to figure if we have filled in all data.
+		 * We should probably fix this to work in a cursor based model and
+		 * use the tokens correctly to not fill too many data in each cursor based call */
+		return 0;
 	}
-	brelse(bh);
+
+	list_for_each_entry(cache_entry, &dir_cache->used, list) {
+		dir_emit(ctx, cache_entry->record.filename, SIMPLEFS_FILENAME_MAXLEN,
+			cache_entry->record.inode_no, DT_UNKNOWN);
+		ctx->pos += sizeof(struct simplefs_dir_record);
+		pos += sizeof(struct simplefs_dir_record);
+	}
 
 	return 0;
 }
@@ -228,12 +306,11 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 					  uint64_t inode_no)
 {
-	struct simplefs_super_block *sfs_sb = SIMPLEFS_SB(sb);
+	struct simplefs_sb_info *sfs_sb_info = SIMPLEFS_SB(sb);
 	struct simplefs_inode *sfs_inode = NULL;
 	struct simplefs_inode *inode_buffer = NULL;
-
-	int i;
 	struct buffer_head *bh;
+	int found = 0;
 
 	/* The inode store can be read once and kept in memory permanently while mounting.
 	 * But such a model will not be scalable in a filesystem with
@@ -243,23 +320,15 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 
 	sfs_inode = (struct simplefs_inode *)bh->b_data;
 
-#if 0
-	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
-		printk(KERN_ERR "Failed to acquire mutex lock %s +%d\n",
-		       __FILE__, __LINE__);
+	/*no 1 is the bit 0 in bitmap*/
+	found = (sfs_sb_info->imap >> (inode_no - 1)) & 1;
+	if (!found)
 		return NULL;
-	}
-#endif
-	for (i = 0; i < sfs_sb->inodes_count; i++) {
-		if (sfs_inode->inode_no == inode_no) {
-			inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
-			memcpy(inode_buffer, sfs_inode, sizeof(*inode_buffer));
 
-			break;
-		}
-		sfs_inode++;
-	}
-//      mutex_unlock(&simplefs_inodes_mgmt_lock);
+	sfs_inode += inode_no - 1;
+	inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
+	BUG_ON(!inode_buffer);
+	memcpy(inode_buffer, sfs_inode, sizeof(*inode_buffer));
 
 	brelse(bh);
 	return inode_buffer;
@@ -341,11 +410,35 @@ int simplefs_inode_save(struct super_block *sb, struct simplefs_inode *sfs_inode
 	}
 
 	brelse(bh);
-
 	mutex_unlock(&simplefs_sb_lock);
 
 	return 0;
 }
+
+static void simplefs_dentry_release(struct dentry *dentry)
+{
+	struct simplefs_dir_cache *dir_cache = dentry->d_fsdata;
+	struct simplefs_cache_entry *tmp, *cache_entry;
+
+	if (dir_cache) {
+		list_for_each_entry_safe(cache_entry, tmp, &dir_cache->free, list) {
+			list_del(&cache_entry->list);
+			kmem_cache_free(sfs_entry_cachep, cache_entry);
+		}
+
+		list_for_each_entry_safe(cache_entry, tmp, &dir_cache->used, list) {
+			list_del(&cache_entry->list);
+			kmem_cache_free(sfs_entry_cachep, cache_entry);
+		}
+	}
+
+	kfree(dir_cache);
+	dentry->d_fsdata = NULL;
+}
+
+static const struct dentry_operations simplefs_dentry_operations = {
+	.d_release = simplefs_dentry_release,
+};
 
 /* FIXME: The write support is rudimentary. I have not figured out a way to do writes
  * from particular offsets (even though I have written some untested code for this below) efficiently. */
@@ -364,10 +457,12 @@ ssize_t simplefs_write(struct file * filp, const char __user * buf, size_t len,
 
 	int retval;
 
+#if 0
 	retval = generic_write_checks(filp, ppos, &len, 0);
 	if (retval) {
 		return retval;
 	}
+#endif
 
 	inode = filp->f_path.dentry->d_inode;
 	sfs_inode = SIMPLEFS_INODE(inode);
@@ -441,10 +536,13 @@ static int simplefs_create(struct inode *dir, struct dentry *dentry,
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 			  umode_t mode);
 
+static int simplefs_unlink(struct inode *dir, struct dentry *dentry);
+
 static struct inode_operations simplefs_inode_ops = {
 	.create = simplefs_create,
 	.lookup = simplefs_lookup,
 	.mkdir = simplefs_mkdir,
+	.unlink = simplefs_unlink,
 };
 
 static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
@@ -452,18 +550,26 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 {
 	struct inode *inode;
 	struct simplefs_inode *sfs_inode;
-	struct super_block *sb;
+	struct super_block *sb = dir->i_sb;
 	struct simplefs_inode *parent_dir_inode;
 	struct buffer_head *bh;
 	struct simplefs_dir_record *dir_contents_datablock;
+	struct dentry *parent_dentry = dentry->d_parent;
+	struct simplefs_cache_entry *cache_entry;
+	struct simplefs_dir_cache * dir_cache;
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(sb);
 	uint64_t count;
 	int ret;
+
+	BUG_ON(parent_dentry->d_inode != dir);
+
+	dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+	BUG_ON(!dir_cache);
 
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
 		return -EINTR;
 	}
-	sb = dir->i_sb;
 
 	ret = simplefs_sb_get_objects_count(sb, &count);
 	if (ret < 0) {
@@ -486,6 +592,7 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 		return -EINVAL;
 	}
 
+	/* create inode */
 	inode = new_inode(sb);
 	if (!inode) {
 		mutex_unlock(&simplefs_directory_children_update_lock);
@@ -494,8 +601,9 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 
 	inode->i_sb = sb;
 	inode->i_op = &simplefs_inode_ops;
-	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-	inode->i_ino = (count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
+	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
+	//inode->i_ino = (count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
+	inode->i_ino = ffz(sb_info->imap);
 
 	sfs_inode = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	sfs_inode->inode_no = inode->i_ino;
@@ -527,18 +635,28 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	}
 
 	simplefs_inode_add(sb, sfs_inode);
-
+	/* Read directory */
 	parent_dir_inode = SIMPLEFS_INODE(dir);
+	/* get a free place for record */
+	cache_entry = free_cache_entry_get(dir_cache);
+	BUG_ON(!cache_entry);
+
 	bh = sb_bread(sb, parent_dir_inode->data_block_number);
 	BUG_ON(!bh);
 
 	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
 
 	/* Navigate to the last record in the directory contents */
-	dir_contents_datablock += parent_dir_inode->dir_children_count;
+	dir_contents_datablock += cache_entry->entry_no;
 
 	dir_contents_datablock->inode_no = sfs_inode->inode_no;
 	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
+	memcpy(&cache_entry->record, dir_contents_datablock, sizeof(struct simplefs_dir_record));
+	cache_entry_insert(&dir_cache->used, cache_entry);
+
+#ifdef SIMPLEFS_DEBUG
+	travers_dir_cache(dir_cache);
+#endif
 
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
@@ -571,6 +689,87 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	return 0;
 }
 
+static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct buffer_head *bh;
+	struct super_block *sb = dir->i_sb;
+	int err = -ENOENT;
+	struct inode *inode = d_inode(dentry);
+	struct simplefs_inode *sfs_inode = SIMPLEFS_INODE(inode);
+	struct simplefs_inode *dir_sfs_inode = SIMPLEFS_INODE(dir);
+	struct simplefs_dir_record *record;
+	struct dentry *parent_dentry = dentry->d_parent;
+	struct simplefs_cache_entry *cache_entry;
+	struct simplefs_dir_cache * dir_cache;
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(sb);
+
+	BUG_ON(parent_dentry->d_inode != dir);
+
+	dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+	BUG_ON(!dir_cache);
+
+	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock))
+	{
+		sfs_trace("Failed to acquire mutex lock\n");
+		return -EINTR;
+	}
+
+	bh = sb_bread(sb, dir_sfs_inode->data_block_number);
+	BUG_ON(!bh);
+
+	cache_entry = used_cache_entry_get(dir_cache, dentry);
+	if (!cache_entry)
+		goto end_unlink;
+
+	record = (struct simplefs_dir_record *)bh->b_data;
+	record += cache_entry->entry_no;
+	record->inode_no = 0;
+
+	memset(&cache_entry->record, 0, sizeof(struct simplefs_dir_record));
+	cache_entry_insert(&dir_cache->free, cache_entry);
+
+	dir->i_ctime = dir->i_mtime = current_time(dir);
+
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock))
+	{
+		sfs_trace("Failed to acquire mutex lock\n");
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return -EINTR;
+	}
+
+	dir_sfs_inode->dir_children_count--;
+	err = simplefs_inode_save(sb, dir_sfs_inode);
+	if (err)
+	{
+		mutex_unlock(&simplefs_inodes_mgmt_lock);
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return err;
+	}
+
+	clear_bit(sfs_inode->inode_no, &sb_info->imap);
+	sfs_inode->inode_no = 0;
+
+	err = simplefs_inode_save(sb, sfs_inode);
+	if (err)
+	{
+		mutex_unlock(&simplefs_inodes_mgmt_lock);
+		mutex_unlock(&simplefs_directory_children_update_lock);
+		return err;
+	}
+
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+	mutex_unlock(&simplefs_directory_children_update_lock);
+	inode->i_ctime = dir->i_ctime;
+	return 0;
+
+end_unlink:
+	return err;
+}
+
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 			  umode_t mode)
 {
@@ -591,56 +790,76 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
 	struct super_block *sb = parent_inode->i_sb;
 	struct buffer_head *bh;
-	struct simplefs_dir_record *record;
-	int i;
+	struct dentry *parent_dentry;
+	struct simplefs_dir_cache *dir_cache;
+	struct simplefs_cache_entry *cache_entry;
+	struct inode *inode;
+	struct simplefs_inode *sfs_inode;
 
-	bh = sb_bread(sb, parent->data_block_number);
-	BUG_ON(!bh);
+	parent_dentry = child_dentry->d_parent;
+    //BUG_ON(parent_dentry->d_inode != parent_inode);
+    if (parent_dentry->d_inode != parent_inode)
+		return ERR_PTR(-ENOENT);
 
-	record = (struct simplefs_dir_record *)bh->b_data;
-	for (i = 0; i < parent->dir_children_count; i++) {
-		if (!strcmp(record->filename, child_dentry->d_name.name)) {
-			/* FIXME: There is a corner case where if an allocated inode,
-			 * is not written to the inode store, but the inodes_count is
-			 * incremented. Then if the random string on the disk matches
-			 * with the filename that we are comparing above, then we
-			 * will use an invalid uninitialized inode */
+    dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
 
-			struct inode *inode;
-			struct simplefs_inode *sfs_inode;
+	if (!dir_cache) {
+		parent_dentry->d_fsdata = simplefs_cache_alloc();
+		if (IS_ERR(parent_dentry->d_fsdata))
+		    return parent_dentry->d_fsdata;
 
-			sfs_inode = simplefs_get_inode(sb, record->inode_no);
+		bh = sb_bread(sb, parent->data_block_number);
+		BUG_ON(!bh);
 
-			inode = new_inode(sb);
-			inode->i_ino = record->inode_no;
-			inode_init_owner(inode, parent_inode, sfs_inode->mode);
-			inode->i_sb = sb;
-			inode->i_op = &simplefs_inode_ops;
-
-			if (S_ISDIR(inode->i_mode))
-				inode->i_fop = &simplefs_dir_operations;
-			else if (S_ISREG(inode->i_mode))
-				inode->i_fop = &simplefs_file_operations;
-			else
-				printk(KERN_ERR
-				       "Unknown inode type. Neither a directory nor a file");
-
-			/* FIXME: We should store these times to disk and retrieve them */
-			inode->i_atime = inode->i_mtime = inode->i_ctime =
-			    CURRENT_TIME;
-
-			inode->i_private = sfs_inode;
-
-			d_add(child_dentry, inode);
-			return NULL;
-		}
-		record++;
+		dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+		dir_cache_build(dir_cache, bh);
 	}
 
+#ifdef SIMPLEFS_DEBUG
+	travers_dir_cache(dir_cache);
+#endif
+
+	cache_entry = used_cache_entry_get(dir_cache, child_dentry);
+	if (!cache_entry)
+		goto out;
+
+	/* FIXME: There is a corner case where if an allocated inode,
+	 * is not written to the inode store, but the inodes_count is
+	 * incremented. Then if the random string on the disk matches
+	 * with the filename that we are comparing above, then we
+	 * will use an invalid uninitialized inode */
+	sfs_inode = simplefs_get_inode(sb, cache_entry->record.inode_no);
+	if (!sfs_inode)
+		return ERR_PTR(-ENOENT);
+
+	inode = new_inode(sb);
+	inode->i_ino = cache_entry->record.inode_no;
+	inode_init_owner(inode, parent_inode, sfs_inode->mode);
+	inode->i_sb = sb;
+	inode->i_op = &simplefs_inode_ops;
+
+	if (S_ISDIR(inode->i_mode))
+		inode->i_fop = &simplefs_dir_operations;
+	else if (S_ISREG(inode->i_mode))
+		inode->i_fop = &simplefs_file_operations;
+	else
+		printk(KERN_ERR
+		       "Unknown inode type. Neither a directory nor a file");
+
+	/* FIXME: We should store these times to disk and retrieve them */
+	inode->i_atime = inode->i_mtime = inode->i_ctime =
+	    current_time(inode);
+
+	inode->i_private = sfs_inode;
+
+	d_add(child_dentry, inode);
+#if 0
 	printk(KERN_ERR
 	       "No inode found for the filename [%s]\n",
 	       child_dentry->d_name.name);
+#endif
 
+out:
 	return NULL;
 }
 
@@ -661,6 +880,43 @@ static const struct super_operations simplefs_sops = {
 	.destroy_inode = simplefs_destory_inode,
 };
 
+#ifdef SIMPLEFS_DEBUG
+static void imap_dump(struct super_block *sb)
+{
+	struct simplefs_sb_info *sb_info = sb->s_fs_info;
+	pr_info("starting imap dump: imap %lu\n",  sb_info->imap);
+}
+#endif
+
+static void fill_imap(struct super_block *sb)
+{
+	int i;
+	struct simplefs_sb_info *sb_info = sb->s_fs_info;
+	struct simplefs_inode *simple_inode;
+	struct buffer_head *bh;
+	int icount = SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_inode);
+
+	bh = sb_bread(sb, SIMPLEFS_INODESTORE_BLOCK_NUMBER);
+	simple_inode = (struct simplefs_inode *)bh->b_data;
+
+	for (i = 0; i < SIMPLEFS_START_INO; i++)
+		set_bit(i, &sb_info->imap);
+
+	simple_inode += SIMPLEFS_START_INO;
+	for (i = SIMPLEFS_START_INO; i < icount; i++) {
+		if (simple_inode->inode_no != 0) {
+			pr_err("func %s, line %d, ino %lld\n", __func__, __LINE__, simple_inode->inode_no);
+			set_bit(i, &sb_info->imap);
+		}
+		simple_inode++;
+	}
+
+	brelse(bh);
+#ifdef SIMPLEFS_DEBUG
+	imap_dump(sb);
+#endif
+}
+
 /* This function, as the name implies, Makes the super_block valid and
  * fills filesystem specific information in the super block */
 int simplefs_fill_super(struct super_block *sb, void *data, int silent)
@@ -668,6 +924,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct inode *root_inode;
 	struct buffer_head *bh;
 	struct simplefs_super_block *sb_disk;
+	struct simplefs_sb_info *sb_info;
 	int ret = -EPERM;
 
 	bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
@@ -698,10 +955,20 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_magic = SIMPLEFS_MAGIC;
 
 	/* For all practical purposes, we will be using this s_fs_info as the super block */
-	sb->s_fs_info = sb_disk;
+	sb_info = kzalloc(sizeof(struct simplefs_sb_info), GFP_KERNEL);
+	if (!sb_info) {
+		brelse(bh);
+		return -ENOMEM;
+	}
+
+	sb_info->sb = sb_disk;
+	sb_info->bh = bh;
+	sb->s_fs_info = sb_info;
+	fill_imap(sb);
 
 	sb->s_maxbytes = SIMPLEFS_DEFAULT_BLOCK_SIZE;
 	sb->s_op = &simplefs_sops;
+	sb->s_d_op = &simplefs_dentry_operations;
 
 	root_inode = new_inode(sb);
 	root_inode->i_ino = SIMPLEFS_ROOTDIR_INODE_NUMBER;
@@ -710,7 +977,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	root_inode->i_op = &simplefs_inode_ops;
 	root_inode->i_fop = &simplefs_dir_operations;
 	root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime =
-	    CURRENT_TIME;
+	    current_time(root_inode);
 
 	root_inode->i_private =
 	    simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
@@ -726,13 +993,13 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 
 	if (!sb->s_root) {
 		ret = -ENOMEM;
+		kfree(sb_info);
 		goto release;
 	}
 
-	ret = 0;
+	return 0;
 release:
 	brelse(bh);
-
 	return ret;
 }
 
@@ -755,11 +1022,14 @@ static struct dentry *simplefs_mount(struct file_system_type *fs_type,
 
 static void simplefs_kill_superblock(struct super_block *sb)
 {
+	struct simplefs_sb_info *sb_info = sb->s_fs_info;
 	printk(KERN_INFO
 	       "simplefs superblock is destroyed. Unmount succesful.\n");
 	/* This is just a dummy function as of now. As our filesystem gets matured,
 	 * we will do more meaningful operations here */
 
+	brelse(sb_info->bh);
+	kfree(sb_info);
 	kill_block_super(sb);
 	return;
 }
@@ -785,6 +1055,17 @@ static int simplefs_init(void)
 		return -ENOMEM;
 	}
 
+	sfs_entry_cachep = kmem_cache_create("sfs_entry_cachep",
+										sizeof(struct simplefs_cache_entry),
+										0,
+										(SLAB_RECLAIM_ACCOUNT| SLAB_MEM_SPREAD),
+										NULL);
+
+	if (!sfs_entry_cachep) {
+		kmem_cache_destroy(sfs_inode_cachep);
+		return -ENOMEM;
+	}
+
 	ret = register_filesystem(&simplefs_fs_type);
 	if (likely(ret == 0))
 		printk(KERN_INFO "Sucessfully registered simplefs\n");
@@ -799,6 +1080,7 @@ static void simplefs_exit(void)
 	int ret;
 
 	ret = unregister_filesystem(&simplefs_fs_type);
+	kmem_cache_destroy(sfs_entry_cachep);
 	kmem_cache_destroy(sfs_inode_cachep);
 
 	if (likely(ret == 0))
